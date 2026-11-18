@@ -83,6 +83,41 @@ MESHY_TIMEOUT = (10, 60)
 # a socket timeout, or from a second MCP server) gets the refine already paid for.
 _meshy_refines = {}
 
+# Sloyd, with the user's own API key: a client id and secret pair. Every
+# input is one job. Its GLB URL comes from the finished job and may be a
+# short-lived signed URL, so it is read again right before each download.
+SLOYD_API_BASE = "https://api.sloyd.ai/api"
+# TEMPORARY compatibility path, remove once GET /jobs/{jobId} returns
+# outputs.glbUrl (or glbUrl): today's API sends no URL field, and the docs say
+# to build this public URL from the job id. Used only when no field is present.
+SLOYD_LEGACY_GLB_URL = "https://storage.googleapis.com/ai-services-quality/jobs/{}.glb"
+SLOYD_KEY_URL = "https://api-dashboard.sloyd.ai"
+SLOYD_PROMPT_MAX = 4096
+SLOYD_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+SLOYD_GLB_MAX_BYTES = 500 * 1024 * 1024
+# Statuses for a signed URL that expired or was refused; a fresh one is asked for once.
+SLOYD_EXPIRED_STATUSES = (400, 401, 403, 410)
+SLOYD_DOWNLOAD_ERRORS = {
+    "expired": "Sloyd's download link was refused twice. Resume the job to get a fresh link",
+    "private": "Sloyd's download link is not on a public address",
+    "redirects": "Too many redirects downloading the Sloyd model",
+    "too_large": "Sloyd model is larger than 500 MB",
+}
+# quality -> mesh fields, from Sloyd's own use-case defaults (game-lowpoly,
+# game-highpoly, viz-standard). Nothing is sent without one, so Sloyd's apply.
+SLOYD_PRESETS = {
+    "lowpoly": {"targetFaceCount": 10000, "textureResolution": "1k", "topology": "triangles"},
+    "standard": {"targetFaceCount": 40000, "textureResolution": "2k", "topology": "auto"},
+    "high": {"targetFaceCount": 100000, "textureResolution": "2k", "topology": "triangles"},
+}
+SLOYD_FACE_COUNT_MAX = 500000
+# Views for multi-image-to-3D, named by file stem in a folder; front is required.
+SLOYD_VIEWS = ("front", "left", "back", "right")
+SLOYD_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+SLOYD_JOB_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+SLOYD_HEADERS = {"User-Agent": "mcp-for-blender/" + ".".join(str(part) for part in bl_info["version"])}
+SLOYD_TIMEOUT = (10, 60)
+
 # Tripo, with the user's own key. Sidebar model id -> label; the id is what
 # the request sends. Text and image are each one task.
 TRIPO_DOMAINS = [
@@ -1388,6 +1423,26 @@ class BlenderMCPServer:
             return None, {"error": f"Unknown Meshy model. Choose one of: {', '.join(MESHY_MODELS)}"}
         return model, None
 
+    def _get_sloyd_credentials(self):
+        """(client_id, client_secret), or None. BLENDERMCP_SLOYD_API_KEY holds
+        both as "<client_id>:<client_secret>", the form Sloyd's own MCP uses."""
+        client_id = self._get_config_value(
+            "blendermcp_sloyd_client_id",
+            "sloyd_client_id",
+            "BLENDERMCP_SLOYD_CLIENT_ID",
+        ).strip()
+        client_secret = self._get_config_value(
+            "blendermcp_sloyd_client_secret",
+            "sloyd_client_secret",
+            "BLENDERMCP_SLOYD_CLIENT_SECRET",
+        ).strip()
+        if client_id and client_secret:
+            return client_id, client_secret
+        api_key_id, _, api_key_secret = os.getenv("BLENDERMCP_SLOYD_API_KEY", "").strip().partition(":")
+        if api_key_id and api_key_secret:
+            return api_key_id, api_key_secret
+        return None
+
     def _get_worldlabs_api_key(self):
         return self._get_config_value(
             "blendermcp_worldlabs_api_key",
@@ -1694,6 +1749,7 @@ class BlenderMCPServer:
             "get_hunyuan3d_status": self.get_hunyuan3d_status,
             "get_tripo_status": self.get_tripo_status,
             "get_meshy_status": self.get_meshy_status,
+            "get_sloyd_status": self.get_sloyd_status,
             "get_worldlabs_status": self.get_worldlabs_status,
             "export_scene": self.export_scene,
         }
@@ -1765,6 +1821,15 @@ class BlenderMCPServer:
                 "refine_meshy_job": self.refine_meshy_job,
                 "poll_meshy_job_status": self.poll_meshy_job_status,
                 "import_generated_asset_meshy": self.import_generated_asset_meshy,
+            })
+
+        # Sloyd runs on the user's own key only, so not while Premium is the
+        # generation source. getattr so scenes from before Sloyd still dispatch.
+        if getattr(bpy.context.scene, "blendermcp_use_sloyd", False) and not premium_active():
+            handlers.update({
+                "create_sloyd_job": self.create_sloyd_job,
+                "poll_sloyd_job_status": self.poll_sloyd_job_status,
+                "import_generated_asset_sloyd": self.import_generated_asset_sloyd,
             })
 
         # World Labs likewise, through Premium or on the user's own key.
@@ -5675,6 +5740,301 @@ class BlenderMCPServer:
                 shutil.rmtree(temp_dir)
     #endregion
 
+    #region Sloyd
+    def get_sloyd_status(self):
+        """Get the current status of Sloyd integration."""
+        if premium_active():
+            return {
+                "enabled": False,
+                "message": "Sloyd runs on your own Sloyd API key only and isn't available while Premium is the "
+                           "generation source. To use it, switch Generation Source to Your own API keys in the "
+                           "MCP for Blender add-on preferences.",
+            }
+        if not getattr(bpy.context.scene, "blendermcp_use_sloyd", False):
+            return {
+                "enabled": False,
+                "message": """Sloyd integration is currently disabled. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. Under AI Model Generation, check Sloyd
+                            3. Fill in the Client ID and Client Secret from api-dashboard.sloyd.ai""",
+            }
+        if not self._get_sloyd_credentials():
+            return {
+                "enabled": False,
+                "message": """Sloyd integration is currently enabled, but the API key is not given. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. Under AI Model Generation, keep Sloyd checked
+                            3. Fill in the Client ID and Client Secret from api-dashboard.sloyd.ai""",
+            }
+        return {
+            "enabled": True,
+            "message": ("Sloyd integration is enabled and ready to use. It takes a text prompt, one image, or a "
+                        "folder of views named front, left, back and right (front and at least one more)."),
+        }
+
+    def _sloyd_headers(self):
+        credentials = self._get_sloyd_credentials()
+        if not credentials:
+            return None, {"error": "Sloyd client ID and secret are not given"}
+        client_id, client_secret = credentials
+        return {**SLOYD_HEADERS, "x-client-id": client_id, "x-client-secret": client_secret}, None
+
+    @staticmethod
+    def _sloyd_parse(response):
+        """(payload, None) on success, else (None, {"error": fixed message}).
+        Sloyd's error bodies are not relayed, so nothing from the request,
+        the credentials included, can reach a reply."""
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if response.ok and isinstance(payload, dict):
+            return payload, None
+        if response.ok:
+            return None, {"error": "Sloyd sent an unexpected reply"}
+        fixed = {
+            401: "Sloyd rejected the client ID and secret. Check them at api-dashboard.sloyd.ai",
+            402: "Not enough Sloyd API credits. Buy prepaid credits at api-dashboard.sloyd.ai, then retry",
+            404: "Sloyd has no such job for this API key",
+            422: ("Sloyd rejected the input. Check the prompt (up to 4096 characters) and that images are "
+                  "PNG, JPEG or WebP up to 20 MB"),
+            429: ("Sloyd allows 5 running jobs at once per account, including jobs started in the Sloyd "
+                  "web app. Wait for one to finish, then retry"),
+        }
+        return None, {"error": fixed.get(response.status_code,
+                                         f"Sloyd request failed with status {response.status_code}")}
+
+    def _sloyd_request(self, method, path, **kwargs):
+        headers, error = self._sloyd_headers()
+        if error:
+            return None, error
+        try:
+            response = getattr(requests, method)(f"{SLOYD_API_BASE}{path}", headers=headers,
+                                                 timeout=SLOYD_TIMEOUT, **kwargs)
+        except Exception:
+            return None, {"error": "Sloyd request failed. Check the internet connection and try again"}
+        return self._sloyd_parse(response)
+
+    @staticmethod
+    def _sloyd_image(image):
+        """A multipart file part for one image: a public http(s) URL or a local
+        file, either checked by its magic bytes before it is sent."""
+        try:
+            if re.match(r"^https?://", image, re.IGNORECASE):
+                data = _fetch_public_image(image)
+            elif not os.path.isfile(image):
+                return None, {"error": f"Image file not found: {image}"}
+            elif os.path.getsize(image) > SLOYD_IMAGE_MAX_BYTES:
+                return None, {"error": "Sloyd accepts images up to 20 MB"}
+            else:
+                data = _read_image_file(image)
+        except ValueError as e:
+            return None, {"error": str(e)}
+        except Exception:
+            return None, {"error": "Couldn't download the image. Give a public image URL or a local file path"}
+        if len(data) > SLOYD_IMAGE_MAX_BYTES:
+            return None, {"error": "Sloyd accepts images up to 20 MB"}
+        if data.startswith(b"\x89PNG"):
+            return ("image.png", data, "image/png"), None
+        if data.startswith(b"\xff\xd8\xff"):
+            return ("image.jpg", data, "image/jpeg"), None
+        return ("image.webp", data, "image/webp"), None
+
+    @staticmethod
+    def _sloyd_views(folder):
+        """View name -> image path, from files named front, left, back, right."""
+        views = {}
+        for entry in sorted(os.listdir(folder)):
+            stem, suffix = osp.splitext(entry)
+            path = osp.join(folder, entry)
+            if stem.lower() not in SLOYD_VIEWS or suffix.lower() not in SLOYD_IMAGE_SUFFIXES or not osp.isfile(path):
+                continue
+            if stem.lower() in views:
+                return None, {"error": f"More than one {stem.lower()} image in {folder}"}
+            views[stem.lower()] = path
+        if "front" not in views or len(views) < 2:
+            return None, {"error": "A Sloyd image folder needs front.png and at least one of left.png, back.png "
+                                   "or right.png (JPG and WebP work too)"}
+        return views, None
+
+    @staticmethod
+    def _sloyd_mesh_fields(quality, face_count):
+        """Sloyd's targetFaceCount / textureResolution / topology for a quality
+        preset and a face target, which overrides the preset's count."""
+        if quality is not None and quality not in SLOYD_PRESETS:
+            return None, {"error": f"quality must be one of: {', '.join(SLOYD_PRESETS)}"}
+        fields = dict(SLOYD_PRESETS.get(quality, {}))
+        if face_count is not None:
+            if isinstance(face_count, bool) or not isinstance(face_count, int) or face_count < 1:
+                return None, {"error": f"face_count must be a whole number from 1 to {SLOYD_FACE_COUNT_MAX}"}
+            fields["targetFaceCount"] = min(face_count, SLOYD_FACE_COUNT_MAX)
+        return fields, None
+
+    def create_sloyd_job(self, text_prompt=None, image=None, quality=None, face_count=None, pose_mode=None):
+        """Start a Sloyd text-to-3D, image-to-3D or multi-image-to-3D job."""
+        text_prompt = (text_prompt or "").strip()
+        image = (image or "").strip()
+        if bool(text_prompt) == bool(image):
+            return {"error": "Provide either a text prompt or an image, not both"}
+        if len(text_prompt) > SLOYD_PROMPT_MAX:
+            return {"error": f"Sloyd prompts are limited to {SLOYD_PROMPT_MAX} characters"}
+        if pose_mode and (pose_mode != "t-pose" or not text_prompt):
+            return {"error": "Sloyd's pose_mode is 't-pose' only, from a text prompt"}
+        fields, error = self._sloyd_mesh_fields(quality, face_count)
+        if error:
+            return error
+        if not self._get_sloyd_credentials():
+            return {"error": "Sloyd client ID and secret are not given"}
+
+        if text_prompt:
+            body = {"prompt": text_prompt, **fields}
+            if pose_mode:
+                body["tPose"] = True
+            data, error = self._sloyd_request("post", "/jobs/text-to-3d", json=body)
+            mode = "text"
+        elif osp.isdir(image):
+            views, error = self._sloyd_views(image)
+            if error:
+                return error
+            files = {}
+            for view, path in views.items():
+                part, error = self._sloyd_image(path)
+                if error:
+                    return error
+                files[f"{view}Image"] = part
+            # This endpoint takes only a face count, as a numeric string.
+            form = {"EnablePBR": "true"}
+            if "targetFaceCount" in fields:
+                form["FaceCount"] = str(fields["targetFaceCount"])
+            data, error = self._sloyd_request("post", "/jobs/multi-image-to-3d", files=files, data=form)
+            mode = "multi-image"
+        else:
+            part, error = self._sloyd_image(image)
+            if error:
+                return error
+            form = {name: str(value) for name, value in fields.items()}
+            data, error = self._sloyd_request("post", "/jobs/image-to-3d", files={"file": part},
+                                              data=form or None)
+            mode = "image"
+        if error:
+            return error
+        job_id = data.get("jobId")
+        if not isinstance(job_id, str) or not SLOYD_JOB_ID.match(job_id):
+            return {"error": "Sloyd response did not include a job id"}
+        return {"job_id": job_id, "mode": mode}
+
+    def poll_sloyd_job_status(self, job_id=None):
+        """Query one Sloyd job. Does not wait; the MCP client polls again."""
+        if not job_id or not SLOYD_JOB_ID.match(str(job_id)):
+            return {"error": "Not a Sloyd job id"}
+        data, error = self._sloyd_request("get", f"/jobs/{quote(str(job_id), safe='')}")
+        if error:
+            return error
+        status = str(data.get("status") or "").lower()
+        if status in ("success", "completed"):
+            return {"status": "SUCCEEDED"}
+        if status in ("error", "failed"):
+            message = data.get("errorMessage")
+            return {"status": "FAILED",
+                    "error": message[:300] if isinstance(message, str) and message else "Sloyd job failed"}
+        if status == "scene-detected":
+            return {"status": "FAILED",
+                    "error": "Sloyd found a whole scene in the image, not one object. Give an image of one object"}
+        fragments = data.get("fragments") if isinstance(data.get("fragments"), list) else []
+        stage = next((f["displayName"] for f in reversed(fragments)
+                      if isinstance(f, dict) and isinstance(f.get("displayName"), str)), None)
+        return {"status": "IN_PROGRESS", "stage": stage}
+
+    def _sloyd_result_url(self, job_id):
+        """The finished job's GLB URL, read fresh from Sloyd. It stays in the
+        addon: a signed URL is a credential while it lasts."""
+        data, error = self._sloyd_request("get", f"/jobs/{quote(str(job_id), safe='')}")
+        if error:
+            return None, error
+        if str(data.get("status") or "").lower() not in ("success", "completed"):
+            return None, {"error": "Sloyd job is not finished"}
+        outputs = data.get("outputs") if isinstance(data.get("outputs"), dict) else {}
+        url = outputs["glbUrl"] if "glbUrl" in outputs else data.get("glbUrl")
+        has_field = "glbUrl" in outputs or "glbUrl" in data
+        if not has_field and isinstance(job_id, str) and SLOYD_JOB_ID.match(job_id):
+            # TEMPORARY legacy fallback, see SLOYD_LEGACY_GLB_URL.
+            print("Sloyd: the job response has no download URL field; using the legacy public URL")
+            url = SLOYD_LEGACY_GLB_URL.format(job_id)
+        if not isinstance(url, str) or not url.lower().startswith("https://"):
+            return None, {"error": "Sloyd finished the job but sent no download URL"}
+        return url, None
+
+    @staticmethod
+    def _sloyd_download(url, path):
+        """Stream a result to `path`: "ok", or a SLOYD_DOWNLOAD_ERRORS key.
+        Every redirect hop must be public, as for image URLs."""
+        for _ in range(IMAGE_FETCH_MAX_REDIRECTS + 1):
+            try:
+                _check_public_url(url)
+            except ValueError:
+                return "private"
+            response = requests.get(url, headers=SLOYD_HEADERS, stream=True, timeout=SLOYD_TIMEOUT,
+                                    allow_redirects=False)
+            location = response.headers.get("Location")
+            if 300 <= response.status_code < 400 and location:
+                url = urljoin(url, location)
+                continue
+            if response.status_code in SLOYD_EXPIRED_STATUSES:
+                return "expired"
+            response.raise_for_status()
+            size = 0
+            with open(path, "wb") as handle:
+                for chunk in response.iter_content(chunk_size=8192):
+                    size += len(chunk)
+                    if size > SLOYD_GLB_MAX_BYTES:
+                        return "too_large"
+                    handle.write(chunk)
+            return "ok"
+        return "redirects"
+
+    def import_generated_asset_sloyd(self, name, job_id=None):
+        """Download a finished Sloyd job's GLB and import it into the current scene.
+        A refused link gets one fresh URL from the job, then one more try."""
+        if not job_id or not SLOYD_JOB_ID.match(str(job_id)):
+            return {"succeed": False, "error": "Not a Sloyd job id"}
+        url, error = self._sloyd_result_url(job_id)
+        if error:
+            return {"succeed": False, **error}
+
+        temp_dir = tempfile.mkdtemp(prefix="sloyd_glb_")
+        glb_path = osp.join(temp_dir, "model.glb")
+        try:
+            outcome = self._sloyd_download(url, glb_path)
+            if outcome == "expired":
+                url, error = self._sloyd_result_url(job_id)
+                if error:
+                    return {"succeed": False, **error}
+                outcome = self._sloyd_download(url, glb_path)
+            if outcome != "ok":
+                return {"succeed": False, "error": SLOYD_DOWNLOAD_ERRORS[outcome]}
+            with open(glb_path, "rb") as handle:
+                if handle.read(4) != b"glTF":
+                    return {"succeed": False, "error": "Sloyd returned a file that is not a GLB"}
+            obj = self._clean_imported_glb(filepath=glb_path, mesh_name=name)
+            if obj is None:
+                return {"succeed": False, "error": "No mesh objects imported from GLB"}
+            result = {
+                "name": obj.name,
+                "type": obj.type,
+                "location": [obj.location.x, obj.location.y, obj.location.z],
+                "rotation": [obj.rotation_euler.x, obj.rotation_euler.y, obj.rotation_euler.z],
+                "scale": [obj.scale.x, obj.scale.y, obj.scale.z],
+            }
+            if obj.type == "MESH":
+                result["world_bounding_box"] = self._get_aabb(obj)
+            return {"succeed": True, **result}
+        except Exception:
+            return {"succeed": False, "error": "Failed to import Sloyd model"}
+        finally:
+            with suppress(Exception):
+                shutil.rmtree(temp_dir)
+    #endregion
+
     #region World Labs
     def get_worldlabs_status(self):
         """Get the current status of World Labs integration."""
@@ -6945,7 +7305,7 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         description="Where 3D model generation runs",
         items=[
             ("BYOK", "Your own API keys",
-             "Use your own Hyper3D, fal.ai, Tripo, Meshy, World Labs or Tencent Cloud keys"),
+             "Use your own Hyper3D, fal.ai, Tripo, Meshy, Sloyd, World Labs or Tencent Cloud keys"),
             ("PREMIUM", "Premium", "Generate through MCP for Blender Premium with one license key"),
         ],
         default="BYOK",
@@ -6987,6 +7347,17 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         name="Meshy API Key",
         subtype="PASSWORD",
         description="Persistent Meshy API Key",
+        default=""
+    )
+    sloyd_client_id: bpy.props.StringProperty(
+        name="Sloyd Client ID",
+        description="Persistent Sloyd API client ID (sok_live_... or sok_test_...)",
+        default=""
+    )
+    sloyd_client_secret: bpy.props.StringProperty(
+        name="Sloyd Client Secret",
+        subtype="PASSWORD",
+        description="Persistent Sloyd API client secret",
         default=""
     )
     worldlabs_api_key: bpy.props.StringProperty(
@@ -7064,6 +7435,10 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
             col.prop(self, "meshy_api_key", text="Meshy API Key")
             col.operator("wm.url_open", text="meshy.ai keys", icon='URL').url = MESHY_KEY_URL
             col.separator()
+            col.prop(self, "sloyd_client_id", text="Sloyd Client ID")
+            col.prop(self, "sloyd_client_secret", text="Sloyd Client Secret")
+            col.operator("wm.url_open", text="Sloyd API keys", icon='URL').url = SLOYD_KEY_URL
+            col.separator()
             col.prop(self, "worldlabs_api_key", text="World Labs API Key")
             col.operator("wm.url_open", text="World Labs keys", icon='URL').url = WORLDLABS_KEY_URL
 
@@ -7073,6 +7448,74 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         cred_box.prop(self, "sketchfab_api_key", text="Sketchfab API Key")
         cred_box.prop(self, "polypizza_api_key", text="Poly Pizza API Key")
 
+# Sloyd's square logo mark in white (32x32 PNG on a transparent background,
+# the sloyd.ai favicon's shape), so it reads like the built-in icons beside it.
+# Shown on the Sloyd row only. It is optional: if it cannot be loaded, the row
+# keeps the built-in icon that Tripo and Meshy use.
+SLOYD_ICON_PNG = (
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAD+klEQVR42rWXS2hdVRSGv3MfaaMx"
+    "lWptam0GSgVBWp1ES1Wc+BjYiRZEHRScKUoUFYf1MRF8IRQ7tbTixOJIcCgFLVpFVHwl4sDSammM"
+    "JrkmuY/c34H/Dqubc29DvG7Y7Ms9e+31n7X+/a91CkkMcFSBFWCL11mgAnR7GRQDBJCcbwSmgRng"
+    "Zj/rCaIyIOeFJ8BbwHZgF/BUAFc+JA1iDnm9S9KypKb+HX9I2uJn1TLbQTivSCoMYsqO2wHEIe+r"
+    "/V8A0sGvSeoGxyueDUk3BZADBVD3epukeUkdz5aj0DKYD72v8BwIgEo48HM7Sm+vkIq2ebEvA70m"
+    "ABWHuFoy61no217l/xKoRa/f2OaCKFzM+Voi8W721kclXSlpwqA6kpYMbjKPQi8hqgAChoB7gXlg"
+    "DlgAGp6LFp4xYCew2b8/As4AHeBt4DGgCWwAzgITwG/20ekFIKnaQeARH9AEWmE2DOg8sAwcswKu"
+    "ADUD2AGcsjS3DeIQ8OTqS/a5VjdIOh/y2mt0fN0ez8KbhOeZQMiOpD8l3Zp89cv9MRsu27DfOC1p"
+    "d2afiDYsaSYj5Ptpby0LfQrd7cD9Dmfd4Zo2L0ZdcNLsAi8BX4fUpTR2XJDq/j/Vnt9TDan1IN7L"
+    "wDCw5PUU8KKfjziXwybeEnDUxUjhRQRcDrxh0MsG/BPw5mrxKlG1Bx2mVlC0e9ZwHYuwJh69EM5K"
+    "HNgfORLzXpG0WdK3Wb6OB4PqRZxH8k1ImgtKKEnvZP7IjZ4NktrxLdhlB/XMuBLkOAKpShqTdCJ7"
+    "kSlJ42HPqhIm1o5LOusrtWSjV0uKSPpdKSkuKfR3Z2lsSnqorCxXAjOfA7aZuXX/9wNwtUmUCKbQ"
+    "Yil0ROlZYZbPeE8dOA685z3dsp7wRjN9KBxSGMAJ4BzwuuX3AQNasOR+GpwrXMVXgOeBn4G9wDW+"
+    "yo2wHySNSPogiE5qJNqZ2DzshiKOxJEY2pTfrZI+dhm+XtL3kh7N2zMk7SlRtgSi6Y5Gkr6UtEHS"
+    "ySDBknTEfKhnPEl5HpH0hff+ImlT4BBI2uur96OkaW/6VdIZSecso38ZyA5Jdzo6DYNclLQzRKHI"
+    "GtWDdr7g9YKaUQM+AW5xxbrE+R0FNnm9DLjKuZsFTgPfAbuBv4FLgSeASedfgUe4RMfWfBI4Ytvq"
+    "etuxA+G6dt0PjvXYOx7SlXh1IEWBTOWqDmO/WUja6HRFoTksaZsJd63Tst0ynvYkffnKfCr+y0fI"
+    "06EXTGPefJnznM2I3Q2d8v5+LdlavgFHgSlgayi1RQ+bbtCWlvXmJHDHer4NV3zAPHDYhEsOuiVT"
+    "Gbghn7EHuG+9X8dJiq8APgOuc72vrsE2Ku2+fwBmX329QVNkXAAAAABJRU5ErkJggg=="
+)
+_sloyd_icon = {"previews": None, "path": None}
+
+
+def _sloyd_icon_unload():
+    """Free the Sloyd preview collection and delete its temp file."""
+    previews, path = _sloyd_icon["previews"], _sloyd_icon["path"]
+    _sloyd_icon.update(previews=None, path=None)
+    if previews is not None:
+        with suppress(Exception):
+            import bpy.utils.previews
+            bpy.utils.previews.remove(previews)
+    if path:
+        with suppress(OSError):
+            os.remove(path)
+
+
+def _sloyd_icon_load():
+    """Load the Sloyd logo for the sidebar. Never raises; on failure the
+    built-in icon is used."""
+    _sloyd_icon_unload()
+    try:
+        import bpy.utils.previews
+        fd, path = tempfile.mkstemp(prefix="blendermcp_sloyd_", suffix=".png")
+        _sloyd_icon["path"] = path
+        with os.fdopen(fd, "wb") as f:
+            f.write(base64.b64decode(SLOYD_ICON_PNG))
+        previews = bpy.utils.previews.new()
+        _sloyd_icon["previews"] = previews
+        previews.load("sloyd", path, 'IMAGE')
+    except Exception as exc:
+        print(f"Sloyd logo not loaded ({type(exc).__name__}); using the built-in icon")
+        _sloyd_icon_unload()
+
+
+def _sloyd_icon_id():
+    """The Sloyd logo's icon_value, or 0 when it is not loaded."""
+    try:
+        previews = _sloyd_icon["previews"]
+        return previews["sloyd"].icon_id if previews is not None else 0
+    except Exception:
+        return 0
+
+
 # Blender UI Panel
 class BLENDERMCP_PT_Panel(bpy.types.Panel):
     bl_label = "MCP for Blender"
@@ -7081,13 +7524,17 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = 'MCP for Blender'
 
-    def _integration_header(self, layout, scene, prop_name, title, icon):
+    def _integration_header(self, layout, scene, prop_name, title, icon, icon_value=0):
         """Draw an integration as a box with a checkbox header row.
+        A non-zero icon_value (a loaded custom icon) replaces the built-in icon.
         Returns the box if the integration is enabled (for settings), else None."""
         box = layout.box()
         row = box.row()
         row.prop(scene, prop_name, text="")
-        row.label(text=title, icon=icon)
+        if icon_value:
+            row.label(text=title, icon_value=icon_value)
+        else:
+            row.label(text=title, icon=icon)
         return box if getattr(scene, prop_name) else None
 
     def draw(self, context):
@@ -7220,6 +7667,20 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
             else:
                 col.prop(scene, "blendermcp_meshy_api_key", text="API Key")
             sub.operator("wm.url_open", text="meshy.ai keys", icon='URL').url = MESHY_KEY_URL
+
+        sub = self._integration_header(layout, scene, "blendermcp_use_sloyd", "Sloyd", 'OUTLINER_OB_MESH',
+                                       icon_value=_sloyd_icon_id())
+        if sub and premium:
+            sub.label(text="Own key only, not in Premium")
+        elif sub:
+            col = sub.column(align=True)
+            if prefs:
+                col.prop(prefs, "sloyd_client_id", text="Client ID")
+                col.prop(prefs, "sloyd_client_secret", text="Client Secret")
+            else:
+                col.prop(scene, "blendermcp_sloyd_client_id", text="Client ID")
+                col.prop(scene, "blendermcp_sloyd_client_secret", text="Client Secret")
+            sub.operator("wm.url_open", text="Sloyd API keys", icon='URL').url = SLOYD_KEY_URL
 
         # Gaussian worlds
         layout.separator()
@@ -7695,6 +8156,25 @@ def register():
         default="",
     )
 
+    bpy.types.Scene.blendermcp_use_sloyd = bpy.props.BoolProperty(
+        name="Use Sloyd",
+        description="Enable Sloyd model generation with your own API key",
+        default=False,
+    )
+
+    bpy.types.Scene.blendermcp_sloyd_client_id = bpy.props.StringProperty(
+        name="Sloyd Client ID",
+        description="API client ID provided by Sloyd",
+        default="",
+    )
+
+    bpy.types.Scene.blendermcp_sloyd_client_secret = bpy.props.StringProperty(
+        name="Sloyd Client Secret",
+        subtype="PASSWORD",
+        description="API client secret provided by Sloyd",
+        default="",
+    )
+
     bpy.types.Scene.blendermcp_use_worldlabs = bpy.props.BoolProperty(
         name="Use World Labs",
         description="Enable World Labs world generation (needs Blender 5.3 or newer)",
@@ -7748,6 +8228,8 @@ def register():
     # Defer socket startup and retry after startup-file or .blend loads.
     _blendermcp_register_auto_start()
 
+    _sloyd_icon_load()
+
     print("BlenderMCP addon registered")
 
 def unregister():
@@ -7761,6 +8243,7 @@ def unregister():
         del bpy.types.blendermcp_server
 
     bpy.utils.unregister_class(BLENDERMCP_PT_Panel)
+    _sloyd_icon_unload()
     bpy.utils.unregister_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
@@ -7790,6 +8273,9 @@ def unregister():
     del bpy.types.Scene.blendermcp_use_meshy
     del bpy.types.Scene.blendermcp_meshy_model
     del bpy.types.Scene.blendermcp_meshy_api_key
+    del bpy.types.Scene.blendermcp_use_sloyd
+    del bpy.types.Scene.blendermcp_sloyd_client_id
+    del bpy.types.Scene.blendermcp_sloyd_client_secret
     del bpy.types.Scene.blendermcp_use_worldlabs
     del bpy.types.Scene.blendermcp_worldlabs_model
     del bpy.types.Scene.blendermcp_worldlabs_api_key

@@ -196,7 +196,7 @@ The addon starts its server when Blender opens. To check, press `N` in the 3D vi
 | **Material control** | Apply and modify materials and colors |
 | **Visual verification** | Multi-angle, camera, wireframe, X-ray and animation-strip views, plus renders, so the AI checks its own work |
 | **Code execution** | The AI writes Blender Python directly |
-| **Asset & model generation** | Poly Haven assets, Sketchfab models, Poly Pizza low-poly models, AI-generated 3D models via Meshy, Tripo, Hyper3D Rodin and Hunyuan3D, and whole Gaussian-splat worlds via World Labs |
+| **Asset & model generation** | Poly Haven assets, Sketchfab models, Poly Pizza low-poly models, AI-generated 3D models via Meshy, Tripo, Sloyd, Hyper3D Rodin and Hunyuan3D, and whole Gaussian-splat worlds via World Labs |
 
 ## Premium
 
@@ -651,7 +651,7 @@ The AI writes Blender Python itself for modelling, layout, materials, animation,
 | `execute_blender_code` | Run Python in your live Blender |
 | `look` | See the result from the `viewport`, `camera`, `angles` (auto-framed multi-view sheet, any direction) or `frames` (animation strip), drawn `solid`, `material`, `rendered`, `wireframe` or `xray`; or show a render or image file |
 | `get_scene_info` | Compact scene summary, one line per object with the fields you pick (placement, materials, topology, weights, ...); drill in with `root` or `query` |
-| `generate_3d` | One call to generate and import a model with Tripo, Hunyuan3D, Hyper3D Rodin or Meshy. Premium generators are preferred automatically |
+| `generate_3d` | One call to generate and import a model with Tripo, Hunyuan3D, Hyper3D Rodin, Meshy or Sloyd. Premium generators are preferred automatically |
 | `generate_gaussian_world` | Generate a whole explorable environment with World Labs and import it as Gaussian splats (Blender 5.3+) |
 | `search_assets` / `import_asset` | [Poly Haven](https://polyhaven.com/) HDRIs, textures and models, [Sketchfab](https://sketchfab.com/) models, [Poly Pizza](https://poly.pizza/) low-poly models |
 | `get_addon_status` | Blender version, addon version, and which libraries and generators are switched on |
@@ -689,6 +689,21 @@ Your own API key needs a paid Meshy plan:
 [get a Meshy API key](https://www.meshy.ai/developers/keys?utm_source=mcp-for-blender&utm_medium=integration&utm_campaign=blender-addon).
 Tick **Meshy** under **AI Model Generation** in the sidebar, choose a **Model**, and paste the key.
 On your own key, ask for a character "in an A-pose" or "in a T-pose" and Meshy generates it in that pose, ready to rig.
+
+#### Sloyd
+
+[Sloyd](https://www.sloyd.ai/) generates textured 3D models from a text prompt, one reference image,
+or several views of one object. It runs on your own Sloyd API key only, not through Premium.
+Sloyd's API is prepaid: create a key and buy credits in the [Sloyd API Dashboard](https://api-dashboard.sloyd.ai)
+(see [API pricing](https://www.sloyd.ai/api/pricing)). A key is a **Client ID** (`sok_live_...`) and a
+**Client Secret**, which is shown only once when you create it.
+Tick **Sloyd** under **AI Model Generation** in the sidebar and fill in both.
+For several views, give a folder with `front.png` and at least one of `left.png`, `back.png` or `right.png`
+(JPEG and WebP work too). Sloyd runs up to 5 jobs at once per account, shared with jobs started in
+the Sloyd web app.
+Ask for a "low-poly" model and Sloyd generates about 10k faces with a 1k texture; "standard" is about 40k faces
+and "high" about 100k, both with a 2k texture. You can also name a face count (up to 500,000).
+Without either, Sloyd picks. From a text prompt, ask for a character "in a T-pose" to rig it.
 
 #### World Labs
 
@@ -783,6 +798,7 @@ Here are some examples of what you can ask Claude to do:
 | *"Get information about the current scene, and make a threejs sketch from it"* | [Watch](https://www.youtube.com/watch?v=jxbNI5L7AH8) |
 | *"Generate a 3D model of a garden gnome through Hyper3D"* | |
 | *"Generate a wooden rocking chair with Meshy"* | |
+| *"Generate a low-poly pine tree with Sloyd"* | |
 | *"Generate a ceramic teapot with Tripo"* | |
 | *"Generate a sunlit Mediterranean courtyard as a world, then put a fountain in it"* | |
 | *"Fill this room with low-poly furniture from Poly Pizza"* | |
@@ -807,6 +823,7 @@ You can store these values there so they survive Blender restarts:
 - Hunyuan3D SecretId / SecretKey
 - Hunyuan3D API URL
 - Meshy API Key
+- Sloyd Client ID / Client Secret
 - Tripo API Key
 - World Labs API Key
 
@@ -821,6 +838,9 @@ For headless setups or CI, credentials can also be injected by environment varia
 | `BLENDERMCP_HUNYUAN3D_SECRET_KEY` |
 | `BLENDERMCP_HUNYUAN3D_API_URL` |
 | `BLENDERMCP_MESHY_API_KEY` |
+| `BLENDERMCP_SLOYD_CLIENT_ID` |
+| `BLENDERMCP_SLOYD_CLIENT_SECRET` |
+| `BLENDERMCP_SLOYD_API_KEY` (`<client id>:<client secret>`, instead of the two above) |
 | `BLENDERMCP_TRIPO_API_KEY` |
 | `BLENDERMCP_WORLDLABS_API_KEY` |
 
