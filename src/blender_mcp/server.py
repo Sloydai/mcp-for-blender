@@ -468,7 +468,8 @@ def _integrations(blender: BlenderConnection, premium_generators) -> dict:
     (generate_gaussian_world) are on. Reads local settings only: Premium generators come from the
     handshake rather than a status call, which would ask the Premium server once per generator."""
     status = {}
-    for name in ("polyhaven", "sketchfab", "polypizza", "hunyuan3d", "hyper3d", "meshy", "tripo", "worldlabs"):
+    for name in ("polyhaven", "sketchfab", "polypizza", "hunyuan3d", "hyper3d", "meshy", "sloyd", "tripo",
+                 "worldlabs"):
         if name in (premium_generators or []):
             status[name] = "on (Premium)"
             continue
@@ -479,7 +480,7 @@ def _integrations(blender: BlenderConnection, premium_generators) -> dict:
             status[name] = "not in this addon version" if _addon_lacks(e) else "unknown"
     return {
         "libraries": {k: status[k] for k in ("polyhaven", "sketchfab", "polypizza")},
-        "generators": {k: status[k] for k in ("tripo", "hunyuan3d", "hyper3d", "meshy")},
+        "generators": {k: status[k] for k in ("tripo", "hunyuan3d", "hyper3d", "meshy", "sloyd")},
         "worlds": {"worldlabs": status["worldlabs"]},
     }
 
@@ -1674,6 +1675,8 @@ def _generation_send(command: str, params: dict):
                 raise generation.Unsupported(TRIPO_UNAVAILABLE)
             if "meshy" in command:
                 raise generation.Unsupported(missing_feature("Meshy", "Meshy"))
+            if "sloyd" in command:
+                raise generation.Unsupported(missing_feature("Sloyd", "Sloyd"))
             if "worldlabs" in command:
                 raise generation.Unsupported(missing_feature("World Labs", "World Labs"))
             label = "Hunyuan3D" if "hunyuan" in command else "Hyper3D Rodin"
@@ -1687,6 +1690,7 @@ def _own_key_generators(blender: BlenderConnection) -> dict[str, bool]:
         ("hunyuan3d", "get_hunyuan3d_status"),
         ("hyper3d", "get_hyper3d_status"),
         ("meshy", "get_meshy_status"),
+        ("sloyd", "get_sloyd_status"),
         ("tripo", "get_tripo_status"),
     ):
         try:
@@ -1711,6 +1715,18 @@ def _meshy_unavailable(blender: BlenderConnection, premium: list[str]) -> str:
             and (premium or "Premium" in (message or ""))):
         return generation.MESHY_PREMIUM_NEEDS_UPDATE
     return " ".join(message.split()) if message else generation.MESHY_UNAVAILABLE
+
+
+def _sloyd_unavailable(blender: BlenderConnection) -> str:
+    """Why Sloyd can't run, in the addon's words: switched off, no key, or
+    Premium selected. Premium with no Premium generator ticked looks like no
+    Premium to the handshake, so only the addon can tell those apart."""
+    try:
+        reply = blender.send_command("get_sloyd_status")
+    except Exception as e:
+        return missing_feature("Sloyd", "Sloyd") if _addon_lacks(e) else generation.SLOYD_UNAVAILABLE
+    message = reply.get("message") if isinstance(reply, dict) and not reply.get("enabled") else None
+    return " ".join(message.split()) if message else generation.SLOYD_UNAVAILABLE
 
 
 def _tripo_unavailable(blender: BlenderConnection) -> str:
@@ -1766,6 +1782,7 @@ async def generate_3d(
     quality: str | None = None,
     bbox_condition: list[float] | None = None,
     pose_mode: str | None = None,
+    face_count: int | None = None,
     job: str | None = None,
     wait_seconds: int = 50,
     user_prompt: str = "",
@@ -1787,23 +1804,43 @@ async def generate_3d(
     - image: Instead of a prompt: an absolute image file path or an http(s) URL. Images attached in
       chat can't be passed: ask the user for a path or URL, don't fall back to text without asking.
       hyper3d also takes a folder of up to 5 images, as views of one object (Premium uses the first).
+      sloyd also takes a folder of views of one object named front, left, back and right (front and
+      at least one more).
     - name: Object name in the scene. Defaults to one made from the prompt.
-    - provider: auto (default), tripo, hunyuan3d, hyper3d or meshy. Auto prefers the user's MCP for
-      Blender Premium generators, then their own API keys.
+    - provider: auto (default), tripo, hunyuan3d, hyper3d, meshy or sloyd. Auto prefers the user's
+      MCP for Blender Premium generators, then their own API keys. sloyd runs on the user's own
+      Sloyd API key only, with up to 5 jobs at once per Sloyd account (web app jobs count too).
     - quality: "standard" or "high" (Premium; not Meshy, and not Tripo on your own key). Omit for
-      the user's default; "high" only when the user asks for more detail.
+      the user's default; "high" only when the user asks for more detail. sloyd: "lowpoly" (about
+      10k faces, 1k texture) when the user asks for low-poly or game-ready, "standard" (40k, 2k)
+      or "high" (100k, 2k); omit for Sloyd's default. "lowpoly" picks sloyd.
     - bbox_condition: hyper3d only: [length, width, height] proportions.
-    - pose_mode: meshy only: "a-pose" or "t-pose" when the user asks for a character in an A-pose
-      or T-pose (often to rig it).
+    - pose_mode: meshy: "a-pose" or "t-pose" when the user asks for a character in an A-pose
+      or T-pose (often to rig it). sloyd: "t-pose" only, from a prompt.
+    - face_count: sloyd only: a target face count when the user names one (at most 500000).
+      Overrides the quality preset's count. Picks sloyd.
     - job: A handle from an earlier call, to resume waiting for it.
     - user_prompt: The user's own words describing what they want, quoted verbatim.
     """
-    if quality not in (None, "standard", "high"):
-        return "Error: quality must be 'standard' or 'high'"
+    if quality not in (None, "standard", "high", "lowpoly"):
+        return "Error: quality must be 'standard', 'high' or 'lowpoly' (sloyd)"
     if pose_mode not in (None, *generation.MESHY_POSES):
         return "Error: pose_mode must be 'a-pose' or 't-pose'"
-    if pose_mode and (provider or "auto").lower() not in ("auto", "meshy"):
-        return "Error: pose_mode is only available with meshy."
+    if face_count is not None and (isinstance(face_count, bool) or not isinstance(face_count, int)
+                                   or face_count < 1):
+        return f"Error: face_count must be a whole number from 1 to {generation.SLOYD_FACE_COUNT_MAX}"
+    requested = (provider or "auto").lower()
+    sloyd_only = quality == "lowpoly" or face_count is not None
+    if requested == "auto" and sloyd_only:
+        requested = "sloyd"
+    elif requested == "auto" and pose_mode:
+        requested = "meshy"
+    if sloyd_only and requested != "sloyd":
+        return "Error: quality='lowpoly' and face_count are only available with sloyd."
+    if pose_mode and requested not in ("meshy", "sloyd"):
+        return "Error: pose_mode is only available with meshy (or sloyd's t-pose)."
+    if pose_mode and requested == "sloyd" and (pose_mode != "t-pose" or image):
+        return "Error: with sloyd, pose_mode is 't-pose' only, from a prompt."
     call_start = time.monotonic()
     wait_seconds = max(10, min(int(wait_seconds or 50), generation.MAX_CALL_S))
     try:
@@ -1814,14 +1851,15 @@ async def generate_3d(
             return await _generation_reply(ctx, parsed, wait_seconds)
         if bool(prompt) == bool(image):
             return "Error: give exactly one of prompt or image."
-        if pose_mode:
-            provider = "meshy"
+        provider = requested
         blender = get_blender_connection()
         premium = _premium_generators(blender)
         own_keys = {} if premium else _own_key_generators(blender)
         if (provider or "").lower() == "meshy" and not (
                 "meshy" in premium if premium else own_keys.get("meshy")):
             return f"Error: {_meshy_unavailable(blender, premium)}"
+        if (provider or "").lower() == "sloyd" and (premium or not own_keys.get("sloyd")):
+            return f"Error: {_sloyd_unavailable(blender)}"
         if (provider or "").lower() == "tripo" and not (
                 "tripo" in premium if premium else own_keys.get("tripo")):
             return f"Error: {_tripo_unavailable(blender)}"
@@ -1832,7 +1870,7 @@ async def generate_3d(
             return f"Error: {generation.MESHY_POSE_NEEDS_UPDATE}"
         note = "" if is_premium else premium_hint_once(ctx, {"mode": None})
         pending = _pending_generations()
-        key = generation.request_key(chosen, prompt, image, quality, bbox_condition, pose_mode)
+        key = generation.request_key(chosen, prompt, image, quality, bbox_condition, pose_mode, face_count)
         started = pending.find(key)
         if started:
             note = (" This request was already generating from an earlier call, so it resumed that "
@@ -1840,7 +1878,8 @@ async def generate_3d(
         else:
             started = generation.submit(
                 _generation_send, chosen, name or generation.default_name(prompt), prompt, image, quality,
-                bbox_condition, supports_quality=(_addon_protocol() or 0) >= 11, pose_mode=pose_mode)
+                bbox_condition, supports_quality=(_addon_protocol() or 0) >= 11, pose_mode=pose_mode,
+                face_count=face_count)
             if isinstance(started, str):
                 return started + note
             pending.add(key, started)

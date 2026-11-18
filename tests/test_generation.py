@@ -2,8 +2,8 @@
 
 A fake addon replays each provider's real reply shapes, so these pin the
 shapes the flow depends on: Premium and fal request ids, Rodin main-site
-subscription keys, Tencent-style Hunyuan responses, and Meshy's preview then
-refine tasks.
+subscription keys, Tencent-style Hunyuan responses, Meshy's preview then
+refine tasks, and Sloyd's single job.
 """
 
 import asyncio
@@ -649,7 +649,7 @@ def test_meshy_is_an_own_key_generator_and_reported(monkeypatch):
 
     blender = _StatusBlender({"get_meshy_status"})
     assert server._own_key_generators(blender) == {
-        "hunyuan3d": False, "hyper3d": False, "meshy": True, "tripo": False}
+        "hunyuan3d": False, "hyper3d": False, "meshy": True, "sloyd": False, "tripo": False}
     assert server._integrations(blender, [])["generators"]["meshy"] == "on"
 
 
@@ -872,4 +872,260 @@ def test_pose_mode_under_premium_says_own_key_only(monkeypatch):
 def test_pose_mode_with_an_older_addon_says_update(monkeypatch):
     reply, send = _pose_call(monkeypatch, protocol=14, pose_mode="a-pose")
     assert reply == f"Error: {generation.MESHY_POSE_NEEDS_UPDATE}"
+    assert send.calls == []
+
+
+# ------------------------------------------------------------------- Sloyd
+#
+# Every Sloyd input is one job on the user's own key, polled by its job id.
+
+def _sloyd(statuses, **replies):
+    """A fake addon whose Sloyd jobs report `statuses[job_id]` in order (the last one repeats)."""
+    def poll(params):
+        queue = statuses[params["job_id"]]
+        reply = queue.pop(0) if len(queue) > 1 else queue[0]
+        return reply if isinstance(reply, dict) else {"status": reply}
+
+    return FakeAddon({
+        "create_sloyd_job": {"job_id": "J1", "mode": "text"},
+        "poll_sloyd_job_status": poll,
+        "import_generated_asset_sloyd": {"succeed": True, "name": "Tree"},
+        **replies,
+    })
+
+
+def test_sloyd_submit_poll_import():
+    send = _sloyd({"J1": [{"status": "IN_PROGRESS", "stage": "Building mesh"}, "SUCCEEDED"]})
+    job = generation.submit(send, "sloyd", "Tree", "a pine tree", None, None, [1, 1, 2], True)
+    assert job.handle == "sloyd:job:J1"
+    # No preset, face count or pose unless asked, so Sloyd's defaults apply.
+    assert send.calls[0] == ("create_sloyd_job", {"text_prompt": "a pine tree", "image": None})
+
+    assert _run(send, job) == (True, "Tree")
+    assert send.calls[-1] == ("import_generated_asset_sloyd", {"name": "Tree", "job_id": "J1"})
+
+
+def test_sloyd_takes_a_folder_of_views(tmp_path):
+    send = _sloyd({"J1": ["SUCCEEDED"]})
+    generation.submit(send, "sloyd", "Chair", None, str(tmp_path), None, None, True)
+    assert send.calls[0] == ("create_sloyd_job", {"text_prompt": None, "image": str(tmp_path)})
+
+
+def test_sloyd_timeout_then_resume_from_the_handle(tmp_path):
+    path = tmp_path / "pending.json"
+    send = _sloyd({"J1": [{"status": "IN_PROGRESS", "stage": "Waiting in Queue"}]})
+    job = generation.submit(send, "sloyd", "Tree", "a pine tree", None, None, None, True)
+    key = generation.request_key("sloyd", "a pine tree", None, None, None)
+    generation.Pending(path).add(key, job)
+
+    imported, detail = _run(send, job, wait=10, pending=generation.Pending(path))
+    assert imported is False
+    assert detail == "IN_PROGRESS Waiting in Queue"
+    assert generation.Pending(path).find(key) == job
+
+    resumed = Job.parse(job.handle, "Tree")
+    send.replies["poll_sloyd_job_status"] = {"status": "SUCCEEDED"}
+    assert _run(send, resumed, pending=generation.Pending(path)) == (True, "Tree")
+    assert generation.Pending(path).find(key) is None
+    assert _count(send, "create_sloyd_job") == 1
+
+
+def test_sloyd_failed_job_says_why_and_clears_pending(tmp_path):
+    path = tmp_path / "pending.json"
+    job = Job("sloyd", "job", "J1", "Tree")
+    generation.Pending(path).add("k", job)
+    send = _sloyd({"J1": [{"status": "FAILED", "error": "Prompt flagged"}]})
+    with pytest.raises(GenerationError, match="Generation failed: Prompt flagged"):
+        _run(send, job, pending=generation.Pending(path))
+    assert generation.Pending(path).find("k") is None
+
+
+def test_sloyd_bad_key_is_relayed_without_retrying():
+    message = "Sloyd rejected the client ID and secret. Check them at api-dashboard.sloyd.ai"
+    send = FakeAddon({"create_sloyd_job": {"error": message}})
+    with pytest.raises(GenerationError, match="Sloyd rejected the client ID"):
+        generation.submit(send, "sloyd", "Tree", "a pine tree", None, None, None, True)
+    assert len(send.calls) == 1
+
+
+def test_sloyd_bad_key_while_polling_keeps_the_handle():
+    send = FakeAddon({"poll_sloyd_job_status": {"error": "Sloyd rejected the client ID and secret."}})
+    with pytest.raises(GenerationError) as e:
+        _run(send, Job("sloyd", "job", "J1", "Tree"))
+    assert "sloyd:job:J1" in str(e.value)
+
+
+def test_sloyd_long_prompts_are_rejected_before_sending():
+    send = FakeAddon({})
+    with pytest.raises(GenerationError, match="4096"):
+        generation.submit(send, "sloyd", "Tree", "x" * 4097, None, None, None, True)
+    assert send.calls == []
+
+
+def test_sloyd_handles_name_a_sloyd_job_kind():
+    assert Job.parse("sloyd:job:01JZQY", "X") == Job("sloyd", "job", "01JZQY", "X")
+    for handle in ("sloyd:task:abc", "sloyd:job:"):
+        with pytest.raises(GenerationError):
+            Job.parse(handle, "X")
+
+
+def test_sloyd_provider_choice():
+    assert choose_provider("sloyd", [], {"sloyd": True}) == ("sloyd", False)
+    assert choose_provider("auto", [], {"hunyuan3d": False, "meshy": False, "sloyd": True}) == ("sloyd", False)
+    # Last in the own-key order, so turning it on doesn't change what others get.
+    assert choose_provider("auto", [], {"meshy": True, "sloyd": True}) == ("meshy", False)
+    assert choose_provider("auto", [], {"hunyuan3d": True, "sloyd": True}) == ("hunyuan3d", False)
+    # Own key only: Premium never picks it, and asking for it under Premium explains why.
+    assert choose_provider("auto", ["hyper3d"], {"sloyd": True}) == ("hyper3d", True)
+    with pytest.raises(GenerationError, match="own Sloyd API key only"):
+        choose_provider("sloyd", ["hyper3d"], {})
+    with pytest.raises(GenerationError, match="Client ID and Client Secret"):
+        choose_provider("sloyd", [], {"sloyd": False})
+
+
+def test_nothing_enabled_mentions_sloyd():
+    with pytest.raises(GenerationError, match="Sloyd"):
+        choose_provider("auto", [], {"sloyd": False})
+
+
+def test_sloyd_is_an_own_key_generator_and_reported():
+    from blender_mcp import server
+
+    blender = _StatusBlender({"get_sloyd_status"})
+    assert server._own_key_generators(blender)["sloyd"] is True
+    assert server._integrations(blender, [])["generators"]["sloyd"] == "on"
+    assert server._integrations(_StatusBlender(set()), [])["generators"]["sloyd"] == "off"
+
+
+def test_sloyd_in_an_older_addon_is_reported_as_missing(monkeypatch):
+    from blender_mcp import server
+
+    class OldAddon:
+        def send_command(self, command, params=None, **_kw):
+            if "sloyd" in command:
+                raise Exception(f"Unknown command type: {command}")
+            return {"enabled": False}
+
+    assert server._integrations(OldAddon(), [])["generators"]["sloyd"] == "not in this addon version"
+    monkeypatch.setattr(server, "get_blender_connection", lambda: OldAddon())
+    for command in ("create_sloyd_job", "poll_sloyd_job_status", "import_generated_asset_sloyd"):
+        with pytest.raises(generation.Unsupported, match="Sloyd"):
+            server._generation_send(command, {})
+
+
+class _SloydStatusBlender:
+    def __init__(self, message):
+        self.message = message
+
+    def send_command(self, command, params=None, **_kw):
+        if command == "get_sloyd_status":
+            return {"enabled": False, "message": self.message}
+        return {"enabled": False}
+
+
+@pytest.mark.parametrize("premium, message", [
+    ([], """Sloyd integration is currently disabled. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel"""),
+    (["hyper3d"], "Sloyd runs on your own Sloyd API key only and isn't available while Premium is the "
+                  "generation source."),
+])
+def test_sloyd_disabled_relays_the_addon_setup_steps(monkeypatch, premium, message):
+    from blender_mcp import server
+
+    monkeypatch.setattr(server, "get_blender_connection", lambda: _SloydStatusBlender(message))
+    monkeypatch.setattr(server, "_premium_generators", lambda _: premium)
+    monkeypatch.setattr(server, "_generation_send", lambda *_a: pytest.fail("nothing may be generated"))
+    reply = asyncio.run(server.generate_3d(None, prompt="a stool", provider="sloyd", wait_seconds=10))
+    assert reply == "Error: " + " ".join(message.split())
+
+
+def test_sloyd_import_refreshes_the_viewport_app():
+    from blender_mcp.openai_apps import SCENE_CHANGING_COMMANDS
+
+    assert "import_generated_asset_sloyd" in SCENE_CHANGING_COMMANDS
+
+
+def test_sloyd_submit_sends_preset_face_count_and_pose_when_set():
+    send = _sloyd({"J1": ["SUCCEEDED"]})
+    generation.submit(send, "sloyd", "Knight", "a knight", None, "lowpoly", None, True,
+                      pose_mode="t-pose", face_count=8000)
+    assert send.calls[0] == ("create_sloyd_job", {"text_prompt": "a knight", "image": None, "quality": "lowpoly",
+                                                  "face_count": 8000, "pose_mode": "t-pose"})
+
+
+def test_face_count_keeps_request_keys_apart():
+    plain = generation.request_key("sloyd", "a chest", None, "lowpoly", None)
+    assert plain == generation.request_key("sloyd", "a chest", None, "lowpoly", None, None, None)
+    assert plain != generation.request_key("sloyd", "a chest", None, "lowpoly", None, None, 5000)
+    assert (generation.request_key("sloyd", "a chest", None, None, None, None, 5000)
+            != generation.request_key("sloyd", "a chest", None, None, None, None, 6000))
+
+
+def _sloyd_call(monkeypatch, own_keys=None, send=None, **kwargs):
+    from blender_mcp import server
+
+    send = send or _sloyd({"J1": ["IN_PROGRESS"]})
+    monkeypatch.setattr(server, "get_blender_connection", lambda: None)
+    monkeypatch.setattr(server, "_premium_generators", lambda _: [])
+    monkeypatch.setattr(server, "_own_key_generators",
+                        lambda _: own_keys or {"hunyuan3d": True, "meshy": True, "sloyd": True})
+    monkeypatch.setattr(server, "_generation_send", send)
+    monkeypatch.setattr(server, "_pending_generations", lambda: generation.Pending(None))
+    monkeypatch.setattr(server, "_addon_protocol", lambda: 16)
+    monkeypatch.setattr(generation, "POLL_INTERVAL_S", 1000.0)
+
+    class Ctx:
+        async def report_progress(self, *_):
+            pass
+
+    kwargs.setdefault("prompt", "a treasure chest")
+    return asyncio.run(server.generate_3d(Ctx(), wait_seconds=10, **kwargs)), send
+
+
+@pytest.mark.parametrize("kwargs, sent", [
+    ({"quality": "lowpoly"}, {"quality": "lowpoly"}),
+    ({"face_count": 12000}, {"face_count": 12000}),
+    ({"face_count": 900000, "provider": "sloyd"}, {"face_count": 900000}),
+    ({"quality": "high", "provider": "sloyd"}, {"quality": "high"}),
+    ({"pose_mode": "t-pose", "provider": "sloyd"}, {"pose_mode": "t-pose"}),
+])
+def test_sloyd_mesh_options_reach_the_addon(monkeypatch, kwargs, sent):
+    # lowpoly and face_count are Sloyd's, so auto picks it over the other own keys.
+    reply, send = _sloyd_call(monkeypatch, **kwargs)
+    assert 'job="sloyd:job:J1"' in reply
+    assert send.calls[0] == ("create_sloyd_job", {"text_prompt": "a treasure chest", "image": None, **sent})
+
+
+def test_auto_with_standard_or_high_keeps_its_order(monkeypatch):
+    # Only Sloyd-only options pick Sloyd; quality="standard" still goes to the usual first choice.
+    send = FakeAddon({"create_hunyuan_job": {"Response": {"JobId": "h1"}},
+                      "poll_hunyuan_job_status": {"Response": {"Status": "RUN"}}})
+    reply, _ = _sloyd_call(monkeypatch, own_keys={"hunyuan3d": True, "sloyd": True}, send=send, quality="standard")
+    assert 'job="hunyuan3d:job:job_h1"' in reply
+    assert [command for command, _ in send.calls][0] == "create_hunyuan_job"
+
+
+@pytest.mark.parametrize("kwargs, needle", [
+    ({"quality": "ultra"}, "quality must be 'standard', 'high' or 'lowpoly'"),
+    ({"quality": "lowpoly", "provider": "tripo"}, "only available with sloyd"),
+    ({"face_count": 5000, "provider": "meshy"}, "only available with sloyd"),
+    ({"face_count": 0}, "face_count must be a whole number"),
+    ({"face_count": -10}, "face_count must be a whole number"),
+    ({"face_count": True}, "face_count must be a whole number"),
+    ({"pose_mode": "a-pose", "provider": "sloyd"}, "'t-pose' only"),
+    ({"pose_mode": "t-pose", "provider": "sloyd", "prompt": None, "image": "https://example.com/a.png"},
+     "'t-pose' only"),
+])
+def test_sloyd_mesh_options_reject_bad_requests_before_generating(monkeypatch, kwargs, needle):
+    reply, send = _sloyd_call(monkeypatch, **kwargs)
+    assert needle in reply
+    assert send.calls == []
+
+
+def test_sloyd_lowpoly_without_sloyd_enabled_explains_the_setup(monkeypatch):
+    from blender_mcp import server
+
+    monkeypatch.setattr(server, "_sloyd_unavailable", lambda _b: generation.SLOYD_UNAVAILABLE)
+    reply, send = _sloyd_call(monkeypatch, own_keys={"hunyuan3d": True}, quality="lowpoly")
+    assert reply == f"Error: {generation.SLOYD_UNAVAILABLE}"
     assert send.calls == []
